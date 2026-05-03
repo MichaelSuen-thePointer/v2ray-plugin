@@ -59,6 +59,44 @@ On your client
 ss-local -c config.json -p 443 --plugin v2ray-plugin --plugin-opts "mode=quic;host=mydomain.me"
 ```
 
+### SIP003U UDP over QUIC Datagram
+
+SIP003U support is split between shadowsocks-libev and this plugin:
+
+* shadowsocks-libev `--plugin-mode` decides whether UDP relay traffic is routed through the plugin port.
+* v2ray-plugin `udpMode` decides whether this plugin starts its native UDP relay and which UDP transport it uses.
+
+The TCP transport still follows `mode`. Enabling UDP forwarding does not change an existing WebSocket TCP deployment.
+
+On your server
+
+```sh
+ss-server -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "server;tls;host=mydomain.me;udpMode=quic"
+```
+
+On your client
+
+```sh
+ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;udpMode=quic"
+```
+
+To keep TCP on WebSocket while sending UDP through QUIC Datagram, leave `mode` unset or set it to `websocket`:
+
+```sh
+ss-server -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "server;tls;host=mydomain.me;mode=websocket;udpMode=quic"
+ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;mode=websocket;udpMode=quic"
+```
+
+`udpMode` is separate from `mode`. The first SIP003U UDP version supports only `udpMode=quic`; UDP over WebSocket is not supported. The plugin preserves each encrypted Shadowsocks UDP packet as an opaque datagram and does not parse, decrypt, or modify Shadowsocks UDP payloads.
+
+`udpTimeout` controls the plugin's own UDP-over-QUIC flow table and defaults to 30 seconds:
+
+```sh
+ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;udpMode=quic;udpTimeout=60"
+```
+
+This timeout is separate from shadowsocks-libev's internal UDP relay timeout. The first implementation does not add separate UDP local or remote port options and does not fragment oversized UDP datagrams; oversized packets are dropped and logged. Certificate options are shared with the TCP TLS path, so certificate mismatch errors usually mean `host`, `cert`, `certRaw`, or `key` differs between client and server. If TCP works but UDP bypasses the plugin, check that shadowsocks-libev was started with `--plugin-mode tcp_and_udp` or another UDP-capable plugin mode.
+
 ### Issue a cert for TLS and QUIC
 
 `v2ray-plugin` will look for TLS certificates signed by [acme.sh](https://github.com/acmesh-official/acme.sh) by default.

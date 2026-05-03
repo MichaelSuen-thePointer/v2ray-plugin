@@ -51,6 +51,8 @@ var (
 	certRaw    = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
 	key        = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
 	mode       = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
+	udpMode    = flag.String("udpMode", "", "UDP transport mode: quic.")
+	udpTimeout = flag.Int("udpTimeout", 30, "UDP relay timeout in seconds.")
 	mux        = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
 	server     = flag.Bool("server", false, "Run in server mode")
 	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
@@ -104,24 +106,33 @@ func parseLocalAddr(localAddr string) []string {
 	return strings.Split(localAddr, "|")
 }
 
-func generateConfig() (*core.Config, error) {
-	lport, err := net.PortFromString(*localPort)
-	if err != nil {
-		return nil, newError("invalid localPort:", *localPort).Base(err)
+func applyUDPOptions(opts Args) error {
+	if c, b := opts.Get("udpMode"); b {
+		*udpMode = c
 	}
-	rport, err := strconv.ParseUint(*remotePort, 10, 32)
-	if err != nil {
-		return nil, newError("invalid remotePort:", *remotePort).Base(err)
+	if c, b := opts.Get("udpTimeout"); b {
+		i, err := strconv.Atoi(c)
+		if err != nil {
+			return newError("invalid udpTimeout:", c).Base(err)
+		}
+		*udpTimeout = i
 	}
-	outboundProxy := serial.ToTypedMessage(&freedom.Config{
-		DestinationOverride: &freedom.DestinationOverride{
-			Server: &protocol.ServerEndpoint{
-				Address: net.NewIPOrDomain(net.ParseAddress(*remoteAddr)),
-				Port:    uint32(rport),
-			},
-		},
-	})
+	return validateUDPOptions()
+}
 
+func validateUDPOptions() error {
+	switch *udpMode {
+	case "", "quic":
+	default:
+		return newError("unsupported udpMode:", *udpMode)
+	}
+	if *udpTimeout <= 0 {
+		return newError("invalid udpTimeout:", *udpTimeout)
+	}
+	return nil
+}
+
+func generateTCPStreamConfig() (internet.StreamConfig, bool, error) {
 	var transportSettings proto.Message
 	var connectionReuse bool
 	switch *mode {
@@ -141,7 +152,7 @@ func generateConfig() (*core.Config, error) {
 		}
 		*tlsEnabled = true
 	default:
-		return nil, newError("unsupported mode:", *mode)
+		return internet.StreamConfig{}, false, newError("unsupported mode:", *mode)
 	}
 
 	streamConfig := internet.StreamConfig{
@@ -170,9 +181,10 @@ func generateConfig() (*core.Config, error) {
 				*cert = fmt.Sprintf("%s/.acme.sh/%s/fullchain.cer", homeDir(), *host)
 				logWarn("No TLS cert specified, trying", *cert)
 			}
+			var err error
 			certificate.Certificate, err = readCertificate()
 			if err != nil {
-				return nil, newError("failed to read cert").Base(err)
+				return internet.StreamConfig{}, false, newError("failed to read cert").Base(err)
 			}
 			if *key == "" {
 				*key = fmt.Sprintf("%[1]s/.acme.sh/%[2]s/%[2]s.key", homeDir(), *host)
@@ -180,19 +192,46 @@ func generateConfig() (*core.Config, error) {
 			}
 			certificate.Key, err = filesystem.ReadFile(*key)
 			if err != nil {
-				return nil, newError("failed to read key file").Base(err)
+				return internet.StreamConfig{}, false, newError("failed to read key file").Base(err)
 			}
 			tlsConfig.Certificate = []*tls.Certificate{&certificate}
 		} else if *cert != "" || *certRaw != "" {
 			certificate := tls.Certificate{Usage: tls.Certificate_AUTHORITY_VERIFY}
+			var err error
 			certificate.Certificate, err = readCertificate()
 			if err != nil {
-				return nil, newError("failed to read cert").Base(err)
+				return internet.StreamConfig{}, false, newError("failed to read cert").Base(err)
 			}
 			tlsConfig.Certificate = []*tls.Certificate{&certificate}
 		}
 		streamConfig.SecurityType = serial.GetMessageType(&tlsConfig)
 		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(&tlsConfig)}
+	}
+
+	return streamConfig, connectionReuse, nil
+}
+
+func generateConfig() (*core.Config, error) {
+	lport, err := net.PortFromString(*localPort)
+	if err != nil {
+		return nil, newError("invalid localPort:", *localPort).Base(err)
+	}
+	rport, err := strconv.ParseUint(*remotePort, 10, 32)
+	if err != nil {
+		return nil, newError("invalid remotePort:", *remotePort).Base(err)
+	}
+	outboundProxy := serial.ToTypedMessage(&freedom.Config{
+		DestinationOverride: &freedom.DestinationOverride{
+			Server: &protocol.ServerEndpoint{
+				Address: net.NewIPOrDomain(net.ParseAddress(*remoteAddr)),
+				Port:    uint32(rport),
+			},
+		},
+	})
+
+	streamConfig, connectionReuse, err := generateTCPStreamConfig()
+	if err != nil {
+		return nil, err
 	}
 
 	apps := []*anypb.Any{
@@ -256,6 +295,35 @@ func generateConfig() (*core.Config, error) {
 			App: apps,
 		}, nil
 	}
+}
+
+type pluginServer struct {
+	tcp core.Server
+	udp *udpRelay
+}
+
+func (s *pluginServer) Start() error {
+	if err := s.tcp.Start(); err != nil {
+		return err
+	}
+	if err := s.udp.Start(); err != nil {
+		if closeErr := s.tcp.Close(); closeErr != nil {
+			logWarn(closeErr.Error())
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *pluginServer) Close() error {
+	var closeErr error
+	if err := s.udp.Close(); err != nil {
+		closeErr = err
+	}
+	if err := s.tcp.Close(); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	return closeErr
 }
 
 func startV2Ray() (core.Server, error) {
@@ -342,9 +410,15 @@ func startV2Ray() (core.Server, error) {
 			}
 		}
 
+		if err := applyUDPOptions(opts); err != nil {
+			return nil, err
+		}
+
 		if *vpn {
 			registerControlFunc()
 		}
+	} else if err := validateUDPOptions(); err != nil {
+		return nil, err
 	}
 
 	config, err := generateConfig()
@@ -355,7 +429,11 @@ func startV2Ray() (core.Server, error) {
 	if err != nil {
 		return nil, newError("failed to create v2ray instance").Base(err)
 	}
-	return instance, nil
+	udpRelay, err := newUDPRelayFromOptions()
+	if err != nil {
+		return nil, err
+	}
+	return &pluginServer{tcp: instance, udp: udpRelay}, nil
 }
 
 func printCoreVersion() {

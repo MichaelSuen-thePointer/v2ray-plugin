@@ -1,3 +1,5 @@
 v2ray-plugin*
 /bin/
 /.idea/
+/.gocache/
+/.gomodcache/

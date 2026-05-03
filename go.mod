@@ -6,6 +6,7 @@ toolchain go1.23.2
 
 require (
 	github.com/golang/protobuf v1.5.4
+	github.com/quic-go/quic-go v0.48.1
 	github.com/v2fly/v2ray-core/v5 v5.22.0
 	google.golang.org/protobuf v1.35.1
 )
@@ -19,7 +20,6 @@ require (
 	github.com/miekg/dns v1.1.62 // indirect
 	github.com/onsi/ginkgo/v2 v2.21.0 // indirect
 	github.com/pires/go-proxyproto v0.8.0 // indirect
-	github.com/quic-go/quic-go v0.48.1 // indirect
 	go.uber.org/mock v0.5.0 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
