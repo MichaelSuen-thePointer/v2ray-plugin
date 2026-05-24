@@ -45,13 +45,14 @@ var (
 	remoteAddr = flag.String("remoteAddr", "127.0.0.1", "remote address to forward.")
 	remotePort = flag.String("remotePort", "1080", "remote port to forward.")
 	path       = flag.String("path", "/", "URL path for websocket.")
+	udpPath    = flag.String("udpPath", "/ray-udp", "URL path for UDP over websocket.")
 	host       = flag.String("host", "cloudfront.com", "Hostname for server.")
 	tlsEnabled = flag.Bool("tls", false, "Enable TLS.")
 	cert       = flag.String("cert", "", "Path to TLS certificate file. Overrides certRaw. Default: ~/.acme.sh/{host}/fullchain.cer")
 	certRaw    = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
 	key        = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
 	mode       = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
-	udpMode    = flag.String("udpMode", "", "UDP transport mode: quic.")
+	udpMode    = flag.String("udpMode", "", "UDP transport mode: quic, websocket.")
 	udpTimeout = flag.Int("udpTimeout", 30, "UDP relay timeout in seconds.")
 	mux        = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
 	server     = flag.Bool("server", false, "Run in server mode")
@@ -110,6 +111,9 @@ func applyUDPOptions(opts Args) error {
 	if c, b := opts.Get("udpMode"); b {
 		*udpMode = c
 	}
+	if c, b := opts.Get("udpPath"); b {
+		*udpPath = c
+	}
 	if c, b := opts.Get("udpTimeout"); b {
 		i, err := strconv.Atoi(c)
 		if err != nil {
@@ -122,14 +126,34 @@ func applyUDPOptions(opts Args) error {
 
 func validateUDPOptions() error {
 	switch *udpMode {
-	case "", "quic":
+	case "", "quic", "websocket":
 	default:
 		return newError("unsupported udpMode:", *udpMode)
 	}
 	if *udpTimeout <= 0 {
 		return newError("invalid udpTimeout:", *udpTimeout)
 	}
+	if *udpMode == "websocket" {
+		switch *mode {
+		case "websocket", "quic":
+		default:
+			return newError("udpMode=websocket requires mode=websocket or mode=quic")
+		}
+		if *mode == "websocket" && !isValidWebSocketPath(*path) {
+			return newError("invalid websocket path:", *path)
+		}
+		if !isValidWebSocketPath(*udpPath) {
+			return newError("invalid udp websocket path:", *udpPath)
+		}
+		if *mode == "websocket" && *udpPath == *path {
+			return newError("udpPath must differ from path:", *udpPath)
+		}
+	}
 	return nil
+}
+
+func isValidWebSocketPath(p string) bool {
+	return strings.HasPrefix(p, "/") && !strings.ContainsAny(p, "?#")
 }
 
 func generateTCPStreamConfig() (internet.StreamConfig, bool, error) {
@@ -315,6 +339,48 @@ func (s *pluginServer) Start() error {
 	return nil
 }
 
+type combinedWebSocketServer struct {
+	tcp    core.Server
+	udp    *udpRelay
+	router *webSocketRouter
+}
+
+func (s *combinedWebSocketServer) Start() error {
+	if err := s.tcp.Start(); err != nil {
+		return err
+	}
+	if err := s.udp.Start(); err != nil {
+		if closeErr := s.tcp.Close(); closeErr != nil {
+			logWarn(closeErr.Error())
+		}
+		return err
+	}
+	if err := s.router.Start(); err != nil {
+		if closeErr := s.udp.Close(); closeErr != nil {
+			logWarn(closeErr.Error())
+		}
+		if closeErr := s.tcp.Close(); closeErr != nil {
+			logWarn(closeErr.Error())
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *combinedWebSocketServer) Close() error {
+	var closeErr error
+	if err := s.router.Close(); err != nil {
+		closeErr = err
+	}
+	if err := s.udp.Close(); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	if err := s.tcp.Close(); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	return closeErr
+}
+
 func (s *pluginServer) Close() error {
 	var closeErr error
 	if err := s.udp.Close(); err != nil {
@@ -419,6 +485,10 @@ func startV2Ray() (core.Server, error) {
 		}
 	} else if err := validateUDPOptions(); err != nil {
 		return nil, err
+	}
+
+	if *server && *mode == "websocket" && *udpMode == "websocket" {
+		return startCombinedWebSocketServer()
 	}
 
 	config, err := generateConfig()

@@ -59,14 +59,16 @@ On your client
 ss-local -c config.json -p 443 --plugin v2ray-plugin --plugin-opts "mode=quic;host=mydomain.me"
 ```
 
-### SIP003U UDP over QUIC Datagram
+### SIP003U UDP forwarding
 
 SIP003U support is split between shadowsocks-libev and this plugin:
 
 * shadowsocks-libev `--plugin-mode` decides whether UDP relay traffic is routed through the plugin port.
 * v2ray-plugin `udpMode` decides whether this plugin starts its native UDP relay and which UDP transport it uses.
 
-The TCP transport still follows `mode`. Enabling UDP forwarding does not change an existing WebSocket TCP deployment.
+The TCP transport still follows `mode`. Enabling UDP forwarding does not change an existing TCP deployment unless both `mode=websocket` and `udpMode=websocket` are used on the server, where the plugin owns the public WebSocket listener and routes TCP and UDP by path.
+
+#### UDP over QUIC Datagram
 
 On your server
 
@@ -87,15 +89,37 @@ ss-server -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_u
 ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;mode=websocket;udpMode=quic"
 ```
 
-`udpMode` is separate from `mode`. The first SIP003U UDP version supports only `udpMode=quic`; UDP over WebSocket is not supported. The plugin preserves each encrypted Shadowsocks UDP packet as an opaque datagram and does not parse, decrypt, or modify Shadowsocks UDP payloads.
+#### UDP over WebSocket
 
-`udpTimeout` controls the plugin's own UDP-over-QUIC flow table and defaults to 30 seconds:
+Use `udpMode=websocket` when UDP traffic also needs to pass through an HTTP/WebSocket proxy path, for example a regular Cloudflare proxied hostname. The TCP WebSocket path remains controlled by `path`; the UDP WebSocket path is controlled by `udpPath` and defaults to `/ray-udp`.
+
+On your server
+
+```sh
+ss-server -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "server;tls;host=mydomain.me;mode=websocket;path=/ray;udpMode=websocket;udpPath=/ray-udp"
+```
+
+On your client
+
+```sh
+ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;mode=websocket;path=/ray;udpMode=websocket;udpPath=/ray-udp"
+```
+
+In this mode the server-side plugin listens on the public TCP port, accepts `/ray-udp` itself, and reverse-proxies the normal TCP WebSocket path to an internal loopback v2ray-core listener. `path` and `udpPath` must both start with `/`, must not contain `?` or `#`, and must be different.
+
+`udpMode=websocket` can also be combined with `mode=quic`. In that layout, TCP relay traffic uses v2ray-core QUIC on UDP while UDP relay traffic uses the plugin's WebSocket listener on TCP. Because TCP and UDP sockets are separate, the same numeric port can be reused without the public WebSocket reverse-proxy layer.
+
+Each encrypted Shadowsocks UDP packet is sent as one WebSocket binary message. The plugin preserves packet boundaries and keeps Shadowsocks UDP payloads opaque; it does not parse, decrypt, modify, coalesce, or fragment UDP payloads.
+
+`udpTimeout` controls the plugin's own UDP flow table and defaults to 30 seconds:
 
 ```sh
 ss-local -c config.json -p 443 -u --plugin v2ray-plugin --plugin-mode tcp_and_udp --plugin-opts "tls;host=mydomain.me;udpMode=quic;udpTimeout=60"
 ```
 
-This timeout is separate from shadowsocks-libev's internal UDP relay timeout. The first implementation does not add separate UDP local or remote port options and does not fragment oversized UDP datagrams; oversized packets are dropped and logged. Certificate options are shared with the TCP TLS path, so certificate mismatch errors usually mean `host`, `cert`, `certRaw`, or `key` differs between client and server. If TCP works but UDP bypasses the plugin, check that shadowsocks-libev was started with `--plugin-mode tcp_and_udp` or another UDP-capable plugin mode.
+This timeout is separate from shadowsocks-libev's internal UDP relay timeout. The implementation does not add separate UDP local or remote port options and does not fragment oversized UDP datagrams; oversized packets are dropped and logged. Certificate options are shared with the TCP TLS path, so certificate mismatch errors usually mean `host`, `cert`, `certRaw`, or `key` differs between client and server. If TCP works but UDP bypasses the plugin, check that shadowsocks-libev was started with `--plugin-mode tcp_and_udp` or another UDP-capable plugin mode.
+
+`udpMode=quic` uses QUIC Datagram and needs end-to-end UDP reachability to the plugin. It will not work through a regular Cloudflare orange-cloud HTTP proxy because Cloudflare terminates QUIC/HTTP3 at the edge and speaks HTTP to the origin. `udpMode=websocket` is Cloudflare-compatible, but it carries UDP packets over a reliable WebSocket/TCP stream, so packet loss can cause head-of-line blocking.
 
 ### Issue a cert for TLS and QUIC
 

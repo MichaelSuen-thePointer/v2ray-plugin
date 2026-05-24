@@ -9,12 +9,19 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
+
+const testWebSocketUDPPath = "/ray-udp"
+
+var testWebSocketDialer = websocket.Dialer{}
 
 func withTCPOptionState(t *testing.T) {
 	t.Helper()
@@ -24,6 +31,7 @@ func withTCPOptionState(t *testing.T) {
 	oldRemoteAddr := *remoteAddr
 	oldRemotePort := *remotePort
 	oldPath := *path
+	oldUDPPath := *udpPath
 	oldHost := *host
 	oldTLSEnabled := *tlsEnabled
 	oldCert := *cert
@@ -40,6 +48,7 @@ func withTCPOptionState(t *testing.T) {
 	*remoteAddr = "127.0.0.1"
 	*remotePort = "1080"
 	*path = "/"
+	*udpPath = "/ray-udp"
 	*host = "cloudfront.com"
 	*tlsEnabled = false
 	*cert = ""
@@ -57,6 +66,7 @@ func withTCPOptionState(t *testing.T) {
 		*remoteAddr = oldRemoteAddr
 		*remotePort = oldRemotePort
 		*path = oldPath
+		*udpPath = oldUDPPath
 		*host = oldHost
 		*tlsEnabled = oldTLSEnabled
 		*cert = oldCert
@@ -159,10 +169,87 @@ func TestValidateUDPOptionsAllowsDefaultDisabledMode(t *testing.T) {
 }
 
 func TestValidateUDPOptionsRejectsUnsupportedMode(t *testing.T) {
-	withUDPOptionState(t, "websocket", 30)
+	withUDPOptionState(t, "h3", 30)
 
 	if err := validateUDPOptions(); err == nil {
 		t.Fatal("validateUDPOptions returned nil, want unsupported mode error")
+	}
+}
+
+func TestValidateUDPOptionsAllowsWebSocketMode(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "websocket", 30)
+	*path = "/ray"
+	*udpPath = "/ray-udp"
+
+	if err := validateUDPOptions(); err != nil {
+		t.Fatalf("validateUDPOptions returned error: %v", err)
+	}
+}
+
+func TestValidateUDPOptionsAllowsWebSocketUDPWithQUICTCPMode(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "websocket", 30)
+	*mode = "quic"
+	*path = "unused-quic-tcp-path"
+	*udpPath = "/ray-udp"
+
+	if err := validateUDPOptions(); err != nil {
+		t.Fatalf("validateUDPOptions returned error: %v", err)
+	}
+}
+
+func TestValidateUDPOptionsIgnoresTCPWebSocketPathForQUICTCPMode(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "websocket", 30)
+	*mode = "quic"
+	*path = "not/a/websocket/path"
+	*udpPath = "/ray-udp"
+
+	if err := validateUDPOptions(); err != nil {
+		t.Fatalf("validateUDPOptions returned error: %v", err)
+	}
+}
+
+func TestApplyUDPOptionsReadsWebSocketUDPPath(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "", 30)
+	*path = "/ray"
+
+	opts := Args{
+		"udpMode": []string{"websocket"},
+		"udpPath": []string{"/ray-udp"},
+	}
+	if err := applyUDPOptions(opts); err != nil {
+		t.Fatalf("applyUDPOptions returned error: %v", err)
+	}
+	if *udpMode != "websocket" {
+		t.Fatalf("udpMode = %q, want websocket", *udpMode)
+	}
+	if *udpPath != "/ray-udp" {
+		t.Fatalf("udpPath = %q, want /ray-udp", *udpPath)
+	}
+}
+
+func TestValidateUDPOptionsRejectsSameWebSocketPath(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "websocket", 30)
+	*path = "/ray"
+	*udpPath = "/ray"
+
+	if err := validateUDPOptions(); err == nil {
+		t.Fatal("validateUDPOptions returned nil, want same path error")
+	}
+}
+
+func TestValidateUDPOptionsRejectsInvalidUDPPath(t *testing.T) {
+	withTCPOptionState(t)
+	withUDPOptionState(t, "websocket", 30)
+	*path = "/ray"
+	*udpPath = "ray-udp"
+
+	if err := validateUDPOptions(); err == nil {
+		t.Fatal("validateUDPOptions returned nil, want invalid udp path error")
 	}
 }
 
@@ -337,6 +424,370 @@ func TestUDPRelayExpiresIdleFlows(t *testing.T) {
 	})
 }
 
+func TestWebSocketUDPRelayPreservesDatagramBoundaries(t *testing.T) {
+	clientRelay, serverRelay, clientAddr, closeRelays := startWebSocketUDPRelayPair(t, 5*time.Second)
+	defer closeRelays()
+	_ = clientRelay
+	_ = serverRelay
+
+	appConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket app udp returned error: %v", err)
+	}
+	defer appConn.Close()
+
+	first := []byte("first websocket udp datagram")
+	second := []byte("second websocket udp datagram stays separate")
+	writeUDPTestDatagram(t, appConn, clientAddr, first)
+	writeUDPTestDatagram(t, appConn, clientAddr, second)
+
+	if got := readUDPTestDatagram(t, appConn); string(got) != string(first) {
+		t.Fatalf("first response = %q, want %q", got, first)
+	}
+	if got := readUDPTestDatagram(t, appConn); string(got) != string(second) {
+		t.Fatalf("second response = %q, want %q", got, second)
+	}
+}
+
+func TestWebSocketUDPRelayRoutesMultipleClientFlows(t *testing.T) {
+	clientRelay, serverRelay, clientAddr, closeRelays := startWebSocketUDPRelayPair(t, 5*time.Second)
+	defer closeRelays()
+
+	firstConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket first app udp returned error: %v", err)
+	}
+	defer firstConn.Close()
+	secondConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket second app udp returned error: %v", err)
+	}
+	defer secondConn.Close()
+
+	first := []byte("first websocket flow")
+	second := []byte("second websocket flow")
+	writeUDPTestDatagram(t, firstConn, clientAddr, first)
+	writeUDPTestDatagram(t, secondConn, clientAddr, second)
+
+	if got := readUDPTestDatagram(t, firstConn); string(got) != string(first) {
+		t.Fatalf("first response = %q, want %q", got, first)
+	}
+	if got := readUDPTestDatagram(t, secondConn); string(got) != string(second) {
+		t.Fatalf("second response = %q, want %q", got, second)
+	}
+	eventually(t, time.Second, func() bool {
+		clientRelay.mu.Lock()
+		defer clientRelay.mu.Unlock()
+		return len(clientRelay.clientFlows) == 2
+	})
+	eventually(t, time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 2
+	})
+}
+
+func TestWebSocketUDPRelayExpiresIdleFlows(t *testing.T) {
+	clientRelay, serverRelay, clientAddr, closeRelays := startWebSocketUDPRelayPair(t, 200*time.Millisecond)
+	defer closeRelays()
+
+	appConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket app udp returned error: %v", err)
+	}
+	defer appConn.Close()
+
+	writeUDPTestDatagram(t, appConn, clientAddr, []byte("websocket flow trigger"))
+	_ = readUDPTestDatagram(t, appConn)
+
+	eventually(t, time.Second, func() bool {
+		clientRelay.mu.Lock()
+		defer clientRelay.mu.Unlock()
+		return len(clientRelay.clientFlows) == 1
+	})
+	eventually(t, time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 1
+	})
+	eventually(t, 2*time.Second, func() bool {
+		clientRelay.mu.Lock()
+		defer clientRelay.mu.Unlock()
+		return len(clientRelay.clientFlows) == 0
+	})
+	eventually(t, 2*time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 0
+	})
+}
+
+func TestWebSocketRouterRoutesTCPAndUDPPaths(t *testing.T) {
+	internalHits := make(chan string, 1)
+	internalListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen internal tcp returned error: %v", err)
+	}
+	internalServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		internalHits <- req.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	internalDone := make(chan struct{})
+	go func() {
+		defer close(internalDone)
+		_ = internalServer.Serve(internalListener)
+	}()
+	defer func() {
+		internalServer.Close()
+		<-internalDone
+	}()
+
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket echo udp returned error: %v", err)
+	}
+	echoDone := make(chan struct{})
+	go serveUDPEcho(echoConn, echoDone)
+	defer func() {
+		echoConn.Close()
+		<-echoDone
+	}()
+
+	serverRelay := newUDPRelay(udpRelayConfig{
+		Server:     true,
+		Mode:       "websocket",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: strconv.Itoa(echoConn.LocalAddr().(*net.UDPAddr).Port),
+		Host:       "127.0.0.1",
+		Path:       "/ray-udp",
+		Timeout:    5 * time.Second,
+	})
+	if err := serverRelay.Start(); err != nil {
+		t.Fatalf("server websocket udp relay Start returned error: %v", err)
+	}
+	defer serverRelay.Close()
+
+	router, err := newWebSocketRouter(webSocketRouterConfig{
+		LocalAddr:    "127.0.0.1",
+		LocalPort:    "0",
+		TCPPath:      "/ray",
+		UDPPath:      "/ray-udp",
+		InternalAddr: "127.0.0.1",
+		InternalPort: strconv.Itoa(internalListener.Addr().(*net.TCPAddr).Port),
+	}, serverRelay)
+	if err != nil {
+		t.Fatalf("newWebSocketRouter returned error: %v", err)
+	}
+	if err := router.Start(); err != nil {
+		t.Fatalf("websocket router Start returned error: %v", err)
+	}
+	defer router.Close()
+
+	routerAddr := router.listeners[0].Addr().String()
+	resp, err := http.Get("http://" + routerAddr + "/ray")
+	if err != nil {
+		t.Fatalf("http.Get tcp path returned error: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("tcp path status = %d, want 204", resp.StatusCode)
+	}
+	select {
+	case got := <-internalHits:
+		if got != "/ray" {
+			t.Fatalf("internal path = %q, want /ray", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("internal tcp proxy was not reached")
+	}
+
+	clientRelay := newUDPRelay(udpRelayConfig{
+		Mode:       "websocket",
+		LocalAddr:  "127.0.0.1",
+		LocalPort:  "0",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: strconv.Itoa(router.listeners[0].Addr().(*net.TCPAddr).Port),
+		Host:       "127.0.0.1",
+		Path:       "/ray-udp",
+		Timeout:    5 * time.Second,
+	})
+	if err := clientRelay.Start(); err != nil {
+		t.Fatalf("client websocket udp relay Start returned error: %v", err)
+	}
+	defer clientRelay.Close()
+
+	appConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket app udp returned error: %v", err)
+	}
+	defer appConn.Close()
+	payload := []byte("udp through shared tcp port")
+	writeUDPTestDatagram(t, appConn, clientRelay.listeners[0].LocalAddr(), payload)
+	if got := readUDPTestDatagram(t, appConn); string(got) != string(payload) {
+		t.Fatalf("udp response = %q, want %q", got, payload)
+	}
+}
+
+func TestWebSocketUDPRelayRejectsTextMessages(t *testing.T) {
+	serverRelay, serverAddr, closeServer := startWebSocketUDPRelayServer(t, 5*time.Second)
+	defer closeServer()
+
+	conn, _, err := testWebSocketDialer.Dial("ws://"+serverAddr+testWebSocketUDPPath, nil)
+	if err != nil {
+		t.Fatalf("websocket Dial returned error: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("not a udp packet")); err != nil {
+		t.Fatalf("websocket WriteMessage returned error: %v", err)
+	}
+
+	eventually(t, time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 0
+	})
+}
+
+func TestWebSocketUDPServerExpiresIdleFlowWithoutClientCleanup(t *testing.T) {
+	serverRelay, serverAddr, closeServer := startWebSocketUDPRelayServer(t, 200*time.Millisecond)
+	defer closeServer()
+
+	conn, _, err := testWebSocketDialer.Dial("ws://"+serverAddr+testWebSocketUDPPath, nil)
+	if err != nil {
+		t.Fatalf("websocket Dial returned error: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.BinaryMessage, []byte("server idle cleanup trigger")); err != nil {
+		t.Fatalf("websocket WriteMessage returned error: %v", err)
+	}
+	_, got, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("websocket ReadMessage returned error: %v", err)
+	}
+	if string(got) != "server idle cleanup trigger" {
+		t.Fatalf("websocket response = %q, want trigger payload", got)
+	}
+
+	eventually(t, time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 1
+	})
+	eventually(t, 2*time.Second, func() bool {
+		serverRelay.mu.Lock()
+		defer serverRelay.mu.Unlock()
+		return len(serverRelay.serverFlows) == 0
+	})
+}
+
+func TestStandaloneWebSocketUDPRelayCanShareQUICPortNumber(t *testing.T) {
+	quicUDPPort, closeQUICUDPPort := reserveUDPPort(t)
+	defer closeQUICUDPPort()
+
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket echo udp returned error: %v", err)
+	}
+	echoDone := make(chan struct{})
+	go serveUDPEcho(echoConn, echoDone)
+	defer func() {
+		echoConn.Close()
+		<-echoDone
+	}()
+
+	serverRelay := newUDPRelay(udpRelayConfig{
+		Server:                    true,
+		Mode:                      "websocket",
+		StandaloneWebSocketServer: true,
+		LocalAddr:                 "127.0.0.1",
+		LocalPort:                 quicUDPPort,
+		RemoteAddr:                "127.0.0.1",
+		RemotePort:                strconv.Itoa(echoConn.LocalAddr().(*net.UDPAddr).Port),
+		Host:                      "127.0.0.1",
+		Path:                      testWebSocketUDPPath,
+		Timeout:                   5 * time.Second,
+	})
+	if err := serverRelay.Start(); err != nil {
+		t.Fatalf("standalone websocket udp relay Start returned error: %v", err)
+	}
+	defer serverRelay.Close()
+
+	clientRelay := newUDPRelay(udpRelayConfig{
+		Mode:       "websocket",
+		LocalAddr:  "127.0.0.1",
+		LocalPort:  "0",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: quicUDPPort,
+		Host:       "127.0.0.1",
+		Path:       testWebSocketUDPPath,
+		Timeout:    5 * time.Second,
+	})
+	if err := clientRelay.Start(); err != nil {
+		t.Fatalf("client websocket udp relay Start returned error: %v", err)
+	}
+	defer clientRelay.Close()
+
+	appConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket app udp returned error: %v", err)
+	}
+	defer appConn.Close()
+	payload := []byte("websocket udp beside quic udp")
+	writeUDPTestDatagram(t, appConn, clientRelay.listeners[0].LocalAddr(), payload)
+	if got := readUDPTestDatagram(t, appConn); string(got) != string(payload) {
+		t.Fatalf("udp response = %q, want %q", got, payload)
+	}
+}
+
+func TestStandaloneWebSocketUDPRelayCleansUpAfterStartFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen reserve tcp returned error: %v", err)
+	}
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	if err := listener.Close(); err != nil {
+		t.Fatalf("reserved tcp Close returned error: %v", err)
+	}
+
+	relay := newUDPRelay(udpRelayConfig{
+		Server:                    true,
+		Mode:                      "websocket",
+		StandaloneWebSocketServer: true,
+		LocalAddr:                 "127.0.0.1|127.0.0.1",
+		LocalPort:                 port,
+		RemoteAddr:                "127.0.0.1",
+		RemotePort:                "9",
+		Host:                      "127.0.0.1",
+		Path:                      testWebSocketUDPPath,
+		Timeout:                   5 * time.Second,
+	})
+	if err := relay.Start(); err == nil {
+		relay.Close()
+		t.Fatal("standalone websocket udp relay Start returned nil, want duplicate listener error")
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		relay.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("udp relay goroutines did not exit after Start failure")
+	}
+	if relay.ctx == nil {
+		t.Fatal("relay ctx = nil, want canceled context")
+	}
+	select {
+	case <-relay.ctx.Done():
+	default:
+		t.Fatal("relay context was not canceled after Start failure")
+	}
+	if len(relay.wsListeners) != 0 {
+		t.Fatalf("wsListeners length = %d, want 0 after Start failure", len(relay.wsListeners))
+	}
+}
+
 func startUDPRelayPair(t *testing.T, timeout time.Duration) (*udpRelay, *udpRelay, net.Addr, func()) {
 	t.Helper()
 
@@ -397,6 +848,145 @@ func startUDPRelayPair(t *testing.T, timeout time.Duration) (*udpRelay, *udpRela
 	return clientRelay, serverRelay, clientAddr, closeRelays
 }
 
+func startWebSocketUDPRelayPair(t *testing.T, timeout time.Duration) (*udpRelay, *udpRelay, net.Addr, func()) {
+	t.Helper()
+
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket echo udp returned error: %v", err)
+	}
+	echoDone := make(chan struct{})
+	go serveUDPEcho(echoConn, echoDone)
+
+	echoPort := strconv.Itoa(echoConn.LocalAddr().(*net.UDPAddr).Port)
+	serverRelay := newUDPRelay(udpRelayConfig{
+		Server:     true,
+		Mode:       "websocket",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: echoPort,
+		Host:       "127.0.0.1",
+		Path:       "/ray-udp",
+		Timeout:    timeout,
+	})
+	if err := serverRelay.Start(); err != nil {
+		echoConn.Close()
+		<-echoDone
+		t.Fatalf("server websocket udp relay Start returned error: %v", err)
+	}
+
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/ray-udp" {
+			http.NotFound(w, req)
+			return
+		}
+		serverRelay.ServeWebSocket(w, req)
+	})}
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		serverRelay.Close()
+		echoConn.Close()
+		<-echoDone
+		t.Fatalf("net.Listen http returned error: %v", err)
+	}
+	httpDone := make(chan struct{})
+	go func() {
+		defer close(httpDone)
+		_ = httpServer.Serve(httpListener)
+	}()
+
+	serverPort := strconv.Itoa(httpListener.Addr().(*net.TCPAddr).Port)
+	clientRelay := newUDPRelay(udpRelayConfig{
+		Mode:       "websocket",
+		LocalAddr:  "127.0.0.1",
+		LocalPort:  "0",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: serverPort,
+		Host:       "127.0.0.1",
+		Path:       "/ray-udp",
+		Timeout:    timeout,
+	})
+	if err := clientRelay.Start(); err != nil {
+		httpServer.Close()
+		<-httpDone
+		serverRelay.Close()
+		echoConn.Close()
+		<-echoDone
+		t.Fatalf("client websocket udp relay Start returned error: %v", err)
+	}
+	clientAddr := clientRelay.listeners[0].LocalAddr()
+
+	closeRelays := func() {
+		if err := clientRelay.Close(); err != nil {
+			t.Fatalf("client websocket udp relay Close returned error: %v", err)
+		}
+		httpServer.Close()
+		<-httpDone
+		if err := serverRelay.Close(); err != nil {
+			t.Fatalf("server websocket udp relay Close returned error: %v", err)
+		}
+		echoConn.Close()
+		<-echoDone
+	}
+	return clientRelay, serverRelay, clientAddr, closeRelays
+}
+
+func startWebSocketUDPRelayServer(t *testing.T, timeout time.Duration) (*udpRelay, string, func()) {
+	t.Helper()
+
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket echo udp returned error: %v", err)
+	}
+	echoDone := make(chan struct{})
+	go serveUDPEcho(echoConn, echoDone)
+
+	serverRelay := newUDPRelay(udpRelayConfig{
+		Server:     true,
+		Mode:       "websocket",
+		RemoteAddr: "127.0.0.1",
+		RemotePort: strconv.Itoa(echoConn.LocalAddr().(*net.UDPAddr).Port),
+		Host:       "127.0.0.1",
+		Path:       testWebSocketUDPPath,
+		Timeout:    timeout,
+	})
+	if err := serverRelay.Start(); err != nil {
+		echoConn.Close()
+		<-echoDone
+		t.Fatalf("server websocket udp relay Start returned error: %v", err)
+	}
+
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != testWebSocketUDPPath {
+			http.NotFound(w, req)
+			return
+		}
+		serverRelay.ServeWebSocket(w, req)
+	})}
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		serverRelay.Close()
+		echoConn.Close()
+		<-echoDone
+		t.Fatalf("net.Listen http returned error: %v", err)
+	}
+	httpDone := make(chan struct{})
+	go func() {
+		defer close(httpDone)
+		_ = httpServer.Serve(httpListener)
+	}()
+
+	closeServer := func() {
+		httpServer.Close()
+		<-httpDone
+		if err := serverRelay.Close(); err != nil {
+			t.Fatalf("server websocket udp relay Close returned error: %v", err)
+		}
+		echoConn.Close()
+		<-echoDone
+	}
+	return serverRelay, httpListener.Addr().String(), closeServer
+}
+
 func serveUDPEcho(conn net.PacketConn, done chan<- struct{}) {
 	defer close(done)
 	buf := make([]byte, udpRelayMaxPacketSize)
@@ -431,6 +1021,19 @@ func readUDPTestDatagram(t *testing.T, conn net.PacketConn) []byte {
 	payload := make([]byte, n)
 	copy(payload, buf[:n])
 	return payload
+}
+
+func reserveUDPPort(t *testing.T) (string, func()) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket reserve udp returned error: %v", err)
+	}
+	return strconv.Itoa(conn.LocalAddr().(*net.UDPAddr).Port), func() {
+		if err := conn.Close(); err != nil {
+			t.Fatalf("reserved udp Close returned error: %v", err)
+		}
+	}
 }
 
 func eventually(t *testing.T, timeout time.Duration, condition func() bool) {
